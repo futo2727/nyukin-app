@@ -41,6 +41,10 @@ MASTER_CSV = os.path.join(BASE_DIR, "番号_店名.csv")             # 正しい
 # 文字コードは自動判定する。UTF-8を優先し、ダメならShift-JIS(cp932)を試す
 ENCODINGS = ["utf-8-sig", "utf-8", "cp932"]
 
+# 「店舗コードなし（業者・その他）」の登録を表す目印。
+# 対応表の「読み換える店舗名」の先頭にこれを付けて保存する（例：【店舗コードなし】トヨタ）
+NOCODE_PREFIX = "【店舗コードなし】"
+
 
 # ============================================================
 # 1. Secrets（ネット公開時の秘密設定）の確認
@@ -78,6 +82,33 @@ def normalize(s):
     if s is None:
         return ""
     s = unicodedata.normalize("NFKC", str(s))
+    s = re.sub(r"\s+", "", s)
+    for ch in "（）()【】[]「」『』｛｝{}・,、。.／/":
+        s = s.replace(ch, "")
+    return s
+
+
+def normalize_meigi(s):
+    """振込名義（カタカナ）用の、より強力な文字ならし。
+       通帳のカタカナは表記ゆれが多いので、次まで吸収する：
+       ・全角/半角統一(NFKC)
+       ・ひらがな→カタカナ
+       ・小さいカナ→大きいカナ（ャ→ヤ、ッ→ツ など）
+       ・会社の略号を無視（カ) (カ) ユ) ド) など）
+       ・空白・記号を削除
+    """
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKC", str(s))
+    # ひらがな→カタカナ
+    s = "".join(chr(ord(c) + 0x60) if "ぁ" <= c <= "ゖ" else c for c in s)
+    # 小さいカナ→大きいカナ
+    small = "ァィゥェォッャュョヮヵヶ"
+    large = "アイウエオツヤユヨワカケ"
+    s = s.translate(str.maketrans(small, large))
+    # 会社略号を無視： (カ) / (カ / カ)  などを削除
+    s = re.sub(r"[（(][カユドメシイ][）)]?|[カユドメシイ][）)]", "", s)
+    # 空白・記号を削除
     s = re.sub(r"\s+", "", s)
     for ch in "（）()【】[]「」『』｛｝{}・,、。.／/":
         s = s.replace(ch, "")
@@ -192,7 +223,7 @@ def load_taiou():
             "振込名義": meigi,
             "読み換える店舗名": tenpo,
             "メモ": memo,
-            "_norm_meigi": normalize(meigi),
+            "_norm_meigi": normalize_meigi(meigi),
         })
 
     df = pd.DataFrame(data, columns=["振込名義", "読み換える店舗名", "メモ", "_norm_meigi"])
@@ -209,15 +240,36 @@ def split_stores(tenpo):
 
 
 def lookup_meigi(meigi, taiou_df):
-    """カタカナ名義で対応表を調べる。見つかれば {読み換える店舗名, メモ}、無ければ None。"""
-    nq = normalize(meigi)
+    """カタカナ名義で対応表を調べる。
+       戻り値：
+         ・ぴったり一致 → {"match":"exact", 読み換える店舗名, メモ}
+         ・惜しい（表記ゆれ/1文字違い） → {"match":"near", "candidates":[(似ている度, 行), ...]}
+         ・全然無い → None
+    """
+    nq = normalize_meigi(meigi)
     if nq == "" or taiou_df.empty:
         return None
+
+    # まず、ぴったり一致
     hit = taiou_df[taiou_df["_norm_meigi"] == nq]
-    if len(hit) == 0:
-        return None
-    r = hit.iloc[0]
-    return {"読み換える店舗名": r["読み換える店舗名"], "メモ": r["メモ"]}
+    if len(hit) > 0:
+        r = hit.iloc[0]
+        return {"match": "exact",
+                "読み換える店舗名": r["読み換える店舗名"], "メモ": r["メモ"]}
+
+    # 無ければ、似ている登録を探す（1文字違い・表記ゆれの救済）
+    sims = []
+    for _, r in taiou_df.iterrows():
+        nm = r["_norm_meigi"]
+        if not nm:
+            continue
+        sc = similarity(nq, nm)
+        if sc >= 0.7:
+            sims.append((sc, r))
+    sims.sort(key=lambda x: x[0], reverse=True)
+    if sims:
+        return {"match": "near", "candidates": sims[:3]}
+    return None
 
 
 def find_numbers(store_name, master_df):
@@ -412,20 +464,43 @@ meigi_list = [ln.strip() for ln in text_to_process.splitlines() if ln.strip() !=
 results = []
 not_found = []
 
+def build_conversion(tenpo):
+    """読み換える店舗名から変換結果を作る。
+       ・「店舗コードなし」の登録 → {"no_code": True, "label": 表示名}
+       ・通常（店舗名）        → {"no_code": False, "stores": [各店舗の番号候補]}"""
+    t = str(tenpo).strip()
+    if t.startswith(NOCODE_PREFIX):
+        return {"no_code": True, "label": t[len(NOCODE_PREFIX):].strip()}
+    return {"no_code": False,
+            "stores": [{"入力店舗名": s, "候補": find_numbers(s, master_df)}
+                       for s in split_stores(t)]}
+
+
 for meigi in meigi_list:
     info = lookup_meigi(meigi, taiou_df)
     if info is None:
-        results.append({"meigi": meigi, "found": False})
+        # 全然見つからない → 未登録（②の一覧＆登録候補に入れる）
+        results.append({"meigi": meigi, "found": False, "near": []})
         not_found.append(meigi)
-    else:
-        stores = split_stores(info["読み換える店舗名"])
-        store_results = [{"入力店舗名": s, "候補": find_numbers(s, master_df)} for s in stores]
+    elif info["match"] == "exact":
         results.append({
             "meigi": meigi,
             "found": True,
             "メモ": info["メモ"],
-            "stores": store_results,
+            "conv": build_conversion(info["読み換える店舗名"]),
         })
+    else:
+        # 惜しい（表記ゆれ/1文字違い）→ 近い登録を「もしかして」で提示
+        near_list = []
+        for sc, r in info["candidates"]:
+            near_list.append({
+                "振込名義": r["振込名義"],
+                "メモ": r["メモ"],
+                "score": round(sc, 2),
+                "conv": build_conversion(r["読み換える店舗名"]),
+            })
+        # 登録済みの可能性が高いので、②の未登録一覧には入れない
+        results.append({"meigi": meigi, "found": False, "near": near_list})
 
 # ---------- 結果表示 ----------
 if meigi_list:
@@ -434,21 +509,40 @@ if meigi_list:
         st.markdown("---")
         st.markdown(f"### {item['meigi']}")
 
-        if not item["found"]:
-            st.warning("該当なし（未登録）")
+        def show_conversion(conv):
+            # 店舗コードなし（業者など）の場合
+            if conv.get("no_code"):
+                lbl = conv.get("label")
+                suffix = f"：{lbl}" if lbl else ""
+                st.write(f"・🏷 **店舗コードなし（業者など）**{suffix}")
+                return
+            # 通常の店舗
+            for sr in conv["stores"]:
+                cands = sr["候補"]
+                if not cands:
+                    st.write(f"・{sr['入力店舗名']} → 店舗番号が見つかりませんでした")
+                    continue
+                for c in cands:
+                    tag = "" if c["種類"] == "完全一致" else f"　`{c['種類']}／似ている度 {c['スコア']}`"
+                    st.write(f"・**{c['店名']}**　店舗番号 **{c['店舗番号']}**{tag}")
+
+        if item["found"]:
+            if item.get("メモ"):
+                st.caption(f"📝 メモ：{item['メモ']}")
+            show_conversion(item["conv"])
             continue
 
-        if item.get("メモ"):
-            st.caption(f"📝 メモ：{item['メモ']}")
-
-        for sr in item["stores"]:
-            cands = sr["候補"]
-            if not cands:
-                st.write(f"・{sr['入力店舗名']} → 店舗番号が見つかりませんでした")
-                continue
-            for c in cands:
-                tag = "" if c["種類"] == "完全一致" else f"　`{c['種類']}／似ている度 {c['スコア']}`"
-                st.write(f"・**{c['店名']}**　店舗番号 **{c['店舗番号']}**{tag}")
+        # 見つからなかった場合
+        if item.get("near"):
+            # 惜しい登録がある → もしかして提示
+            st.info("ぴったり一致はありませんでした。近い登録を表示します（入力の表記ゆれかもしれません）：")
+            for nc in item["near"]:
+                st.markdown(f"**🔎 もしかして：{nc['振込名義']}**　`似ている度 {nc['score']}`")
+                if nc["メモ"]:
+                    st.caption(f"📝 メモ：{nc['メモ']}")
+                show_conversion(nc["conv"])
+        else:
+            st.warning("該当なし（未登録）")
 
 # ============================================================
 # 8. 該当なし一覧（あとで登録する候補リスト）
@@ -473,40 +567,64 @@ if meigi_list:
 # ============================================================
 st.markdown("---")
 st.subheader("③ 対応表に登録する（常設フォーム）")
-st.caption("「読み換える店舗名」は、正しいマスター（番号_店名）の店名から検索して選びます（表記ゆれを防ぐため）。")
 
-store_query = st.text_input("読み換える店舗名を検索（例：福臨閣、はしご など）", key="reg_store_query")
+# 登録の種類：店舗（番号あり） or 店舗コードなし（業者など）
+reg_mode = st.radio(
+    "登録の種類",
+    ["店舗として登録（番号あり）", "店舗コードなし（業者・その他）"],
+    key="reg_mode",
+    horizontal=True,
+)
+is_store_mode = reg_mode.startswith("店舗として登録")
 
-selected_store = None
-if store_query.strip():
-    nq = normalize(store_query)
-    matched = master_df[master_df["_norm"].str.contains(re.escape(nq), na=False)]
-    if len(matched) == 0:
-        st.caption("該当する店名が見つかりません。文字を変えて試してください。")
-    else:
-        labels = [f'{row["店名"]}（{row["店舗番号"]}）' for _, row in matched.head(50).iterrows()]
-        names = [row["店名"] for _, row in matched.head(50).iterrows()]
-        choice = st.selectbox("候補から選ぶ", labels, key="reg_store_select")
-        if choice:
-            selected_store = names[labels.index(choice)]
+selected_store = None   # 店舗モードで選ばれた店名
+nocode_label = ""       # コードなしモードの表示ラベル
+
+if is_store_mode:
+    st.caption("「読み換える店舗名」は、正しいマスター（番号_店名）の店名から検索して選びます（表記ゆれを防ぐため）。")
+    store_query = st.text_input("読み換える店舗名を検索（例：福臨閣、はしご など）", key="reg_store_query")
+    if store_query.strip():
+        nq = normalize(store_query)
+        matched = master_df[master_df["_norm"].str.contains(re.escape(nq), na=False)]
+        if len(matched) == 0:
+            st.caption("該当する店名が見つかりません。文字を変えて試してください。")
+        else:
+            labels = [f'{row["店名"]}（{row["店舗番号"]}）' for _, row in matched.head(50).iterrows()]
+            names = [row["店名"] for _, row in matched.head(50).iterrows()]
+            choice = st.selectbox("候補から選ぶ", labels, key="reg_store_select")
+            if choice:
+                selected_store = names[labels.index(choice)]
+else:
+    st.caption("トヨタなどの業者のように、店舗番号が無いものを登録します。")
+    nocode_label = st.text_input("表示名（任意：例 トヨタ、〇〇商事、業者 など）", key="reg_nocode_label")
 
 with st.form("register_form", clear_on_submit=False):
     default_meigi = st.session_state.get("reg_meigi", "")
     reg_meigi = st.text_input("振込名義（カタカナ）", value=default_meigi)
-    st.write(f"選択中の店舗名：**{selected_store if selected_store else '（上の検索で選んでください）'}**")
+    if is_store_mode:
+        st.write(f"選択中の店舗名：**{selected_store if selected_store else '（上の検索で選んでください）'}**")
+    else:
+        shown_label = nocode_label.strip() if nocode_label.strip() else "（表示名なし）"
+        st.write(f"種類：**店舗コードなし（業者など）**／表示名：**{shown_label}**")
     reg_memo = st.text_input("メモ（任意）")
     submitted = st.form_submit_button("追加する", type="primary")
 
 if submitted:
     if not reg_meigi.strip():
         st.error("振込名義を入力してください。")
-    elif not selected_store:
+    elif is_store_mode and not selected_store:
         st.error("読み換える店舗名を、上の検索欄から選んでください。")
     else:
-        backup_path = append_taiou_row(reg_meigi.strip(), selected_store, reg_memo.strip())
+        if is_store_mode:
+            store_value = selected_store
+            done_msg = f"追加しました：{reg_meigi.strip()} → {selected_store}"
+        else:
+            store_value = NOCODE_PREFIX + nocode_label.strip()
+            done_msg = f"追加しました：{reg_meigi.strip()} → 店舗コードなし（業者など）"
+        backup_path = append_taiou_row(reg_meigi.strip(), store_value, reg_memo.strip())
         load_taiou.clear()                       # 表を読み直すためキャッシュを消す
         st.session_state.pop("reg_meigi", None)  # フォームの名義をリセット
-        st.success(f"追加しました：{reg_meigi.strip()} → {selected_store}")
+        st.success(done_msg)
         if backup_path:
             st.caption(f"（バックアップ：{os.path.basename(backup_path)}）")
         st.rerun()
