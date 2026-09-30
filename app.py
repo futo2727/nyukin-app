@@ -324,7 +324,11 @@ def check_password():
 
 check_password()
 
-st.title("🏦 振込名義 → 店舗名・店舗番号 変換ツール")
+st.markdown(
+    "<h1 style='font-size:clamp(1.35rem, 3.4vw, 1.9rem); font-weight:700; margin:0 0 0.6rem 0;'>"
+    "🏦 振込名義 → 店舗名・店舗番号 変換ツール</h1>",
+    unsafe_allow_html=True,
+)
 
 # データ読み込み
 master_df, master_enc = load_master()
