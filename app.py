@@ -298,6 +298,52 @@ def append_taiou_row(meigi, store, memo):
     return backup_path
 
 
+def load_taiou_editable():
+    """削除UI用：対応表の各行を『削除の目印（行番号）』つきで返す。"""
+    if USE_SHEETS:
+        values = get_taiou_worksheet().get_all_values()
+    else:
+        text, _ = read_text_auto(TAIOU_CSV)
+        values = list(csv.reader(io.StringIO(text)))
+
+    entries = []
+    for i, row in enumerate(values):
+        if i == 0:
+            continue  # 見出し
+        row = list(row)
+        if len(row) < 3:
+            row = row + [""] * (3 - len(row))
+        meigi = (row[0] or "").strip()
+        tenpo = (row[1] or "").strip()
+        memo = (row[2] or "").strip()
+        if meigi == "" and tenpo == "":
+            continue
+        entries.append({"row": i + 1, "振込名義": meigi,
+                        "読み換える店舗名": tenpo, "メモ": memo})
+    return entries
+
+
+def delete_taiou_row(row_number):
+    """対応表から指定の行（1始まり）を削除する。"""
+    if USE_SHEETS:
+        get_taiou_worksheet().delete_rows(int(row_number))
+        return None
+
+    # ローカルCSV：バックアップしてから、その行を除いて書き直す
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(BASE_DIR, f"振込名義_店舗名対応表.backup_{ts}.csv")
+    shutil.copy2(TAIOU_CSV, backup_path)
+
+    text, enc = read_text_auto(TAIOU_CSV)
+    rows = list(csv.reader(io.StringIO(text)))
+    write_enc = "utf-8" if enc in ("utf-8", "utf-8-sig") else enc
+    target = int(row_number) - 1
+    rows = [r for idx, r in enumerate(rows) if idx != target]
+    with open(TAIOU_CSV, "w", encoding=write_enc, newline="") as f:
+        csv.writer(f).writerows(rows)
+    return backup_path
+
+
 # ============================================================
 # 7. 画面（UI）
 # ============================================================
@@ -345,20 +391,23 @@ with st.sidebar:
 
 # ---------- ① 入力欄 ----------
 st.subheader("① 通帳の名義（カタカナ）を貼り付け")
-st.caption("改行で区切って、上から順に1件ずつ変換します。")
-text = st.text_area(
+st.caption("名義を貼り付けたら、下の「変換する」ボタンを押してください。（Enterキーは改行に使えます）")
+st.text_area(
     "名義（複数行OK）",
     height=200,
     placeholder="アメリカンハウス\nトータルプランニング\nアールサイエンス",
     key="input_text",
 )
+if st.button("変換する", type="primary"):
+    st.session_state["run_text"] = st.session_state.get("input_text", "")
 
 with st.expander("（将来用）画像アップロード欄 ※今は使いません"):
     st.file_uploader("通帳の画像", type=["png", "jpg", "jpeg"], disabled=True)
     st.caption("画像から文字を読む機能は後回しです。まずはテキスト入力で全機能が動きます。")
 
-# ---------- 変換処理 ----------
-meigi_list = [ln.strip() for ln in text.splitlines() if ln.strip() != ""]
+# ---------- 変換処理（「変換する」ボタンで実行した内容を使う）----------
+text_to_process = st.session_state.get("run_text", "")
+meigi_list = [ln.strip() for ln in text_to_process.splitlines() if ln.strip() != ""]
 
 results = []
 not_found = []
@@ -461,3 +510,48 @@ if submitted:
         if backup_path:
             st.caption(f"（バックアップ：{os.path.basename(backup_path)}）")
         st.rerun()
+
+# ============================================================
+# 10. 登録の取り消し（間違えて追加したときに削除）
+# ============================================================
+st.markdown("---")
+st.subheader("④ 登録の取り消し（間違えて追加したとき）")
+st.caption("登録済みの対応を確認して、不要なものを削除できます。")
+
+if st.checkbox("登録済みの一覧を表示する"):
+    entries = load_taiou_editable()
+    st.caption(f"現在 {len(entries)} 件 登録されています。")
+
+    del_query = st.text_input("絞り込み（振込名義や店舗名の一部を入力）", key="del_query")
+    if del_query.strip():
+        nq = normalize(del_query)
+        shown = [e for e in entries
+                 if nq in normalize(e["振込名義"]) or nq in normalize(e["読み換える店舗名"])]
+    else:
+        shown = entries
+
+    if not shown:
+        st.write("該当する登録がありません。")
+    else:
+        for e in shown:
+            c1, c2 = st.columns([6, 1])
+            memo_txt = f"　📝{e['メモ']}" if e["メモ"] else ""
+            c1.write(f"**{e['振込名義']}** → {e['読み換える店舗名']}{memo_txt}")
+            if c2.button("削除", key=f"del_{e['row']}"):
+                st.session_state["confirm_delete"] = e
+                st.rerun()
+
+    # 削除の確認（間違って消さないように一度確認する）
+    cd = st.session_state.get("confirm_delete")
+    if cd:
+        st.warning(f"「{cd['振込名義']} → {cd['読み換える店舗名']}」を削除します。よろしいですか？")
+        b1, b2 = st.columns(2)
+        if b1.button("はい、削除する", type="primary"):
+            delete_taiou_row(cd["row"])
+            load_taiou.clear()
+            st.session_state.pop("confirm_delete", None)
+            st.success("削除しました。")
+            st.rerun()
+        if b2.button("キャンセル"):
+            st.session_state.pop("confirm_delete", None)
+            st.rerun()
